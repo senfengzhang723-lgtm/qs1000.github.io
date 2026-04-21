@@ -5,9 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>QS1000March Super App</title>
   <script src="https://cdn.tailwindcss.com"></script>
-  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     body { background: #020617; }
@@ -41,6 +41,7 @@
     const SUPABASE_URL = 'https://clozzsvgxuethfiqjhaw.supabase.co';
     const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNsb3p6c3ZneHVldGhmaXFqaGF3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY3MzI5MTcsImV4cCI6MjA5MjMwODkxN30.XtyiFf3mr4JAcYozUv0VrDriBk-iYskRXUyAxBN9_G8'; // Supabase anon/public key
     const SUPABASE_KV_TABLE = 'qs1000_kv';
+    const SUPABASE_MEDIA_BUCKET = 'qs1000-media';
     let supabaseClientCache = null;
 
     function isSupabaseEnabled() {
@@ -78,6 +79,52 @@
         console.warn('[Supabase] write failed', key, error);
         return false;
       }
+    }
+    function safeStorageName(value) {
+      return String(value || 'guest').trim().replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'guest';
+    }
+    function getFileExtension(file, fallback = 'bin') {
+      const name = String(file?.name || '');
+      const fromName = name.includes('.') ? name.split('.').pop() : '';
+      const fromType = String(file?.type || '').split('/')[1] || '';
+      return (fromName || fromType || fallback).replace(/[^a-zA-Z0-9]/g, '').toLowerCase() || fallback;
+    }
+    async function uploadCloudFile(file, kind = 'file', username = '') {
+      const client = getSupabaseClient();
+      if (!client || !file) return null;
+      try {
+        const safeUser = safeStorageName(username || readStoredCurrentUser() || 'guest');
+        const safeKind = safeStorageName(kind || 'file');
+        const ext = getFileExtension(file);
+        const path = `${safeKind}/${safeUser}/${Date.now()}-${Math.random().toString(36).slice(2, 10)}.${ext}`;
+        const { error } = await client.storage.from(SUPABASE_MEDIA_BUCKET).upload(path, file, {
+          cacheControl: '31536000',
+          upsert: false,
+          contentType: file.type || undefined
+        });
+        if (error) throw error;
+        const { data } = client.storage.from(SUPABASE_MEDIA_BUCKET).getPublicUrl(path);
+        return { path, publicUrl: data?.publicUrl || '' };
+      } catch (error) {
+        console.warn('[Supabase] media upload failed', error);
+        return null;
+      }
+    }
+    function dataUrlToFile(dataUrl, filename = 'avatar.jpg') {
+      const [header, body] = String(dataUrl || '').split(',');
+      if (!header || !body) return null;
+      const mime = (header.match(/data:([^;]+)/) || [])[1] || 'image/jpeg';
+      const binary = atob(body);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+      return new File([bytes], filename, { type: mime });
+    }
+    async function uploadAvatarDataUrl(dataUrl, username) {
+      if (typeof dataUrl !== 'string' || !dataUrl.startsWith('data:')) return dataUrl || '';
+      const file = dataUrlToFile(dataUrl, `avatar-${Date.now()}.jpg`);
+      if (!file) return dataUrl;
+      const uploaded = await uploadCloudFile(file, 'avatars', username);
+      return uploaded?.publicUrl || dataUrl;
     }
 
     const Icons = {
@@ -324,6 +371,21 @@
     }
     async function persistFile(file, kind) {
       const id = `${kind}-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+      const uploaded = await uploadCloudFile(file, kind, readStoredCurrentUser() || 'guest');
+      if (uploaded?.publicUrl) {
+        return {
+          id: uploaded.path || id,
+          mediaId: uploaded.path || id,
+          storagePath: uploaded.path || '',
+          kind,
+          name: file.name || id,
+          type: file.type || '',
+          size: file.size || 0,
+          src: uploaded.publicUrl,
+          localPreviewSrc: uploaded.publicUrl,
+          cloud: true
+        };
+      }
       await idbPutMedia({ id, blob: file, name: file.name || id, type: file.type || '', kind, createdAt: Date.now() });
       return { id, kind, name: file.name || id, type: file.type || '', size: file.size || 0 };
     }
@@ -361,11 +423,17 @@
     }
     function normalizeStoredMediaItem(media) {
       if (!media || typeof media !== 'object') return media;
-      return { ...media, src: media.mediaId ? '' : stripEphemeralUrl(media.src), localPreviewSrc: media.mediaId ? '' : stripEphemeralUrl(media.localPreviewSrc) };
+      const safeSrc = stripEphemeralUrl(media.src);
+      const safePreview = stripEphemeralUrl(media.localPreviewSrc);
+      return {
+        ...media,
+        src: safeSrc,
+        localPreviewSrc: safePreview && safePreview === safeSrc ? safePreview : safePreview
+      };
     }
     function normalizeStoredAudio(audio) {
       if (!audio || typeof audio !== 'object') return audio;
-      return { ...audio, src: audio.mediaId ? '' : stripEphemeralUrl(audio.src), localPreviewSrc: audio.mediaId ? '' : stripEphemeralUrl(audio.localPreviewSrc) };
+      return { ...audio, src: stripEphemeralUrl(audio.src), localPreviewSrc: stripEphemeralUrl(audio.localPreviewSrc) };
     }
     function normalizeVideoPostList(posts) {
       return (Array.isArray(posts) ? posts : []).map((post) => ({
@@ -561,15 +629,15 @@
         setLoadError('');
         (async () => {
           if (!audio) { if (alive) setSrc(''); return; }
+          if (audio.localPreviewSrc || audio.src) {
+            if (alive) setSrc(audio.localPreviewSrc || audio.src || '');
+            return;
+          }
           if (audio.mediaId) {
             const url = await getMediaObjectUrl(audio.mediaId);
             if (!alive) { if (url) URL.revokeObjectURL(url); return; }
             urlRef.current = url;
             setSrc(url || audio.localPreviewSrc || audio.src || '');
-            return;
-          }
-          if (audio.localPreviewSrc || audio.src) {
-            if (alive) setSrc(audio.localPreviewSrc || audio.src || '');
             return;
           }
           if (alive) setSrc('');
@@ -899,7 +967,7 @@
         setError('');
         setPassword('');
       }
-      function handleRegister() {
+      async function handleRegister() {
         const latestAccounts = readLatestAccounts();
         const safeUsername = normalizeName(username); const safePassword = normalizePasswordValue(password);
         if (safeUsername.length < 3) { setError('账号至少 3 个字符。'); return; }
@@ -908,6 +976,7 @@
         if (normalizeUserKey(safeUsername) === ADMIN_USERNAME) { setError('这个账号名称已被系统保留，请换一个账号。'); return; }
         if (latestAccounts.some((a) => normalizeUserKey(a.username) === normalizeUserKey(safeUsername))) { setError('这个账号已存在'); return; }
         if (latestAccounts.length >= MAX_LOCAL_ACCOUNTS) { setError(`当前演示版最多支持 ${MAX_LOCAL_ACCOUNTS} 个本地账号。`); return; }
+        const finalAvatar = avatar ? await uploadAvatarDataUrl(avatar, safeUsername) : humanImagePool[Math.floor(Math.random()*10)];
         const account = {
           username: safeUsername,
           password: safePassword,
@@ -916,7 +985,7 @@
             name: safeUsername,
             school,
             intro: intro.trim() || '这个人很神秘，还没有写自我介绍。',
-            avatar: avatar || humanImagePool[Math.floor(Math.random()*10)]
+            avatar: finalAvatar
           },
           likes: [], favorites: [], likedUsers: [], matchedUsers: [], friendIds: [], friendRequests: [], homeCoins: 120, homePlots: defaultPlots
         };
@@ -1202,7 +1271,8 @@
         const file = e.target.files?.[0];
         if (!file) return;
         try {
-          const url = await compressAvatarFile(file);
+          const compressed = await compressAvatarFile(file);
+          const url = await uploadAvatarDataUrl(compressed, account.username);
           setDraft((prev) => ({ ...prev, avatar: url }));
           setSaveNotice('新头像已选中，点击保存资料后生效。');
         } catch {
@@ -2704,7 +2774,7 @@
           const previewUrl = URL.createObjectURL(file);
           chatMediaObjectUrlsRef.current.push(previewUrl);
           const persisted = await persistFile(file, 'image');
-          return { ...persisted, previewUrl, kind: 'image', mediaId: persisted.id, localPreviewSrc: previewUrl };
+          return { ...persisted, previewUrl, kind: 'image', mediaId: persisted.mediaId || persisted.id, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl };
         }));
         setChatImageDrafts(next);
         setChatMediaNotice(`已选中 ${next.length} 张聊天图片，发送后双方账号都能看到。`);
@@ -2717,7 +2787,7 @@
         const previewUrl = URL.createObjectURL(file);
         chatMediaObjectUrlsRef.current.push(previewUrl);
         const persisted = await persistFile(file, 'video');
-        setChatVideoDraft({ ...persisted, previewUrl, kind: 'video', mediaId: persisted.id, localPreviewSrc: previewUrl });
+        setChatVideoDraft({ ...persisted, previewUrl, kind: 'video', mediaId: persisted.mediaId || persisted.id, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl });
         setChatMediaNotice('已选中聊天视频，发送后会直接显示在会话里。');
         e.target.value = '';
       }
@@ -2729,8 +2799,8 @@
         const nowTs = Date.now();
         const nowLabel = currentDateTimeLabel(nowTs);
         const mediaPayload = hasVideo
-          ? [{ kind: 'video', mediaId: chatVideoDraft.mediaId || chatVideoDraft.id, name: chatVideoDraft.name, type: chatVideoDraft.type, size: chatVideoDraft.size, localPreviewSrc: chatVideoDraft.previewUrl }]
-          : chatImageDrafts.map((item) => ({ kind: 'image', mediaId: item.mediaId || item.id, name: item.name, type: item.type, size: item.size, localPreviewSrc: item.previewUrl }));
+          ? [{ kind: 'video', mediaId: chatVideoDraft.mediaId || chatVideoDraft.id, storagePath: chatVideoDraft.storagePath || '', cloud: !!chatVideoDraft.cloud, name: chatVideoDraft.name, type: chatVideoDraft.type, size: chatVideoDraft.size, localPreviewSrc: chatVideoDraft.localPreviewSrc || chatVideoDraft.previewUrl || chatVideoDraft.src || '', src: chatVideoDraft.src || chatVideoDraft.localPreviewSrc || chatVideoDraft.previewUrl || '' }]
+          : chatImageDrafts.map((item) => ({ kind: 'image', mediaId: item.mediaId || item.id, storagePath: item.storagePath || '', cloud: !!item.cloud, name: item.name, type: item.type, size: item.size, localPreviewSrc: item.localPreviewSrc || item.previewUrl || item.src || '', src: item.src || item.localPreviewSrc || item.previewUrl || '' }));
         if (registeredOnlyActiveChat?.isRegisteredAccount && registeredOnlyActiveChatRoomId) {
           const nextMessage = {
             id: `chat-${nowTs}-${Math.random().toString(36).slice(2, 8)}`,
@@ -2763,7 +2833,7 @@
         const next = await Promise.all(files.map(async (file) => {
           const previewUrl = URL.createObjectURL(file); draftObjectUrlsRef.current.push(previewUrl);
           const persisted = await persistFile(file, 'image');
-          return { ...persisted, previewUrl, kind: 'image', mediaId: persisted.id, localPreviewSrc: previewUrl };
+          return { ...persisted, previewUrl, kind: 'image', mediaId: persisted.mediaId || persisted.id, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl };
         }));
         setDraftImages(next);
         setMomentMediaNotice(next.length ? '图片已实时保存到本地数据库，刷新后仍可恢复。' : '');
@@ -2775,7 +2845,7 @@
         if (!file || !file.type.startsWith('video/')) return;
         const previewUrl = URL.createObjectURL(file); draftObjectUrlsRef.current.push(previewUrl);
         const persisted = await persistFile(file, 'video');
-        setDraftVideo({ ...persisted, previewUrl, kind: 'video', mediaId: persisted.id, localPreviewSrc: previewUrl });
+        setDraftVideo({ ...persisted, previewUrl, kind: 'video', mediaId: persisted.mediaId || persisted.id, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl });
         setMomentMediaNotice('视频已实时保存到本地数据库，刷新后仍可恢复。');
       }
       function clearMomentComposer() {
@@ -2801,7 +2871,7 @@
         const previewUrl = URL.createObjectURL(file);
         videoDraftObjectUrlsRef.current.push(previewUrl);
         const persisted = await persistFile(file, 'video');
-        setVideoDraft({ ...persisted, previewUrl, kind: 'video', mediaId: persisted.id, localPreviewSrc: previewUrl });
+        setVideoDraft({ ...persisted, previewUrl, kind: 'video', mediaId: persisted.mediaId || persisted.id, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl });
         setVideoPublishMode('video');
         setVideoPublishNotice('短视频已选择，可以直接发布到视频号。');
       }
@@ -2815,7 +2885,7 @@
           const previewUrl = URL.createObjectURL(file);
           videoImageDraftUrlsRef.current.push(previewUrl);
           const persisted = await persistFile(file, 'image');
-          nextImages.push({ ...persisted, previewUrl, kind: 'image', mediaId: persisted.id, localPreviewSrc: previewUrl });
+          nextImages.push({ ...persisted, previewUrl, kind: 'image', mediaId: persisted.mediaId || persisted.id, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl });
         }
         setVideoImageDrafts(nextImages);
         setVideoPublishMode('images');
@@ -2829,7 +2899,7 @@
         const previewUrl = URL.createObjectURL(file);
         videoMusicDraftUrlsRef.current.push(previewUrl);
         const persisted = await persistFile(file, 'audio');
-        setVideoMusicDraft({ ...persisted, previewUrl });
+        setVideoMusicDraft({ ...persisted, previewUrl, mediaId: persisted.mediaId || persisted.id, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl });
         setVideoPublishNotice('配乐已添加，发布后图片视频会带音乐播放器。');
       }
       function setVideoCommentInput(postId, value) {
@@ -2902,7 +2972,7 @@
           const previewUrl = URL.createObjectURL(file);
           videoCommentImageDraftUrlsRef.current[postId].push(previewUrl);
           const persisted = await persistFile(file, 'image');
-          return { kind: 'image', mediaId: persisted.id, name: persisted.name, type: persisted.type, size: persisted.size, localPreviewSrc: previewUrl, src: previewUrl };
+          return { kind: 'image', mediaId: persisted.mediaId || persisted.id, storagePath: persisted.storagePath || '', cloud: !!persisted.cloud, name: persisted.name, type: persisted.type, size: persisted.size, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl };
         }));
         setVideoCommentImages(postId, items);
         setVideoCommentNotice((prev) => ({ ...prev, [postId]: `评论图片已保存到本地，可发送 ${items.length} 张。` }));
@@ -2925,7 +2995,7 @@
           author: currentAccount.profile.name,
           avatar: currentAccount.profile.avatar,
           text: value,
-          images: images.map((img) => ({ kind: 'image', mediaId: img.mediaId, name: img.name, type: img.type, size: img.size })),
+          images: images.map((img) => ({ kind: 'image', mediaId: img.mediaId, storagePath: img.storagePath || '', cloud: !!img.cloud, name: img.name, type: img.type, size: img.size, localPreviewSrc: img.localPreviewSrc || img.src || '', src: img.src || img.localPreviewSrc || '' })),
           createdAt: Date.now(),
         };
         setVideoPosts((prev) => prev.map((item) => item.id === postId ? { ...item, comments: [comment, ...(item.comments || [])] } : item));
@@ -3011,7 +3081,7 @@
             username: currentUsername,
             author: currentAccount.profile.name,
             avatar: currentAccount.profile.avatar,
-            audio: { mediaId: persisted.id, name: persisted.name, type: persisted.type, size: persisted.size, localPreviewSrc: previewUrl },
+            audio: { mediaId: persisted.mediaId || persisted.id, storagePath: persisted.storagePath || '', cloud: !!persisted.cloud, name: persisted.name, type: persisted.type, size: persisted.size, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl },
             createdAt: Date.now(),
           };
           setVideoPosts((prev) => prev.map((item) => item.id === postId ? { ...item, comments: [comment, ...(item.comments || [])] } : item));
@@ -3033,8 +3103,8 @@
         if (videoPublishMode === 'video' && !hasVideo) { setVideoPublishNotice('请先上传短视频。'); return; }
         if (videoPublishMode === 'images' && !hasImages) { setVideoPublishNotice('请先上传图片，最多 36 张。'); return; }
         const media = videoPublishMode === 'images'
-          ? videoImageDrafts.map((item) => ({ kind: 'image', mediaId: item.mediaId || item.id, name: item.name, type: item.type, size: item.size, localPreviewSrc: item.previewUrl || item.localPreviewSrc || '', src: item.previewUrl || item.localPreviewSrc || '' }))
-          : [{ kind: 'video', mediaId: videoDraft.mediaId || videoDraft.id, name: videoDraft.name, type: videoDraft.type, size: videoDraft.size, localPreviewSrc: videoDraft.previewUrl || videoDraft.localPreviewSrc || '', src: videoDraft.previewUrl || videoDraft.localPreviewSrc || '' }];
+          ? videoImageDrafts.map((item) => ({ kind: 'image', mediaId: item.mediaId || item.id, storagePath: item.storagePath || '', cloud: !!item.cloud, name: item.name, type: item.type, size: item.size, localPreviewSrc: item.localPreviewSrc || item.previewUrl || item.src || '', src: item.src || item.localPreviewSrc || item.previewUrl || '' }))
+          : [{ kind: 'video', mediaId: videoDraft.mediaId || videoDraft.id, storagePath: videoDraft.storagePath || '', cloud: !!videoDraft.cloud, name: videoDraft.name, type: videoDraft.type, size: videoDraft.size, localPreviewSrc: videoDraft.localPreviewSrc || videoDraft.previewUrl || videoDraft.src || '', src: videoDraft.src || videoDraft.localPreviewSrc || videoDraft.previewUrl || '' }];
         const post = {
           id: `video-${Date.now()}`,
           username: currentUsername,
@@ -3044,7 +3114,7 @@
           caption: videoCaptionDraft.trim(),
           media,
           postType: videoPublishMode === 'images' ? 'imageStory' : 'video',
-          music: videoMusicDraft ? { mediaId: videoMusicDraft.mediaId || videoMusicDraft.id, name: videoMusicDraft.name, type: videoMusicDraft.type, size: videoMusicDraft.size, localPreviewSrc: videoMusicDraft.previewUrl || videoMusicDraft.localPreviewSrc || '', src: videoMusicDraft.previewUrl || videoMusicDraft.localPreviewSrc || '' } : null,
+          music: videoMusicDraft ? { mediaId: videoMusicDraft.mediaId || videoMusicDraft.id, storagePath: videoMusicDraft.storagePath || '', cloud: !!videoMusicDraft.cloud, name: videoMusicDraft.name, type: videoMusicDraft.type, size: videoMusicDraft.size, localPreviewSrc: videoMusicDraft.localPreviewSrc || videoMusicDraft.previewUrl || videoMusicDraft.src || '', src: videoMusicDraft.src || videoMusicDraft.localPreviewSrc || videoMusicDraft.previewUrl || '' } : null,
           likes: 0,
           likedBy: [],
           comments: [],
@@ -3060,9 +3130,9 @@
           return;
         }
         const media = momentsMediaMode === 'images'
-          ? draftImages.map((item) => ({ kind: 'image', mediaId: item.mediaId || item.id, name: item.name, type: item.type, size: item.size, localPreviewSrc: item.previewUrl || item.localPreviewSrc || '', src: item.previewUrl || item.localPreviewSrc || '' }))
+          ? draftImages.map((item) => ({ kind: 'image', mediaId: item.mediaId || item.id, storagePath: item.storagePath || '', cloud: !!item.cloud, name: item.name, type: item.type, size: item.size, localPreviewSrc: item.localPreviewSrc || item.previewUrl || item.src || '', src: item.src || item.localPreviewSrc || item.previewUrl || '' }))
           : draftVideo
-            ? [{ kind: 'video', mediaId: draftVideo.mediaId || draftVideo.id, name: draftVideo.name, type: draftVideo.type, size: draftVideo.size, isLive: momentsMediaMode === 'live', localPreviewSrc: draftVideo.previewUrl || draftVideo.localPreviewSrc || '', src: draftVideo.previewUrl || draftVideo.localPreviewSrc || '' }]
+            ? [{ kind: 'video', mediaId: draftVideo.mediaId || draftVideo.id, storagePath: draftVideo.storagePath || '', cloud: !!draftVideo.cloud, name: draftVideo.name, type: draftVideo.type, size: draftVideo.size, isLive: momentsMediaMode === 'live', localPreviewSrc: draftVideo.localPreviewSrc || draftVideo.previewUrl || draftVideo.src || '', src: draftVideo.src || draftVideo.localPreviewSrc || draftVideo.previewUrl || '' }]
             : [];
         const post = { id: `m-${Date.now()}`, username: currentUsername, author: effectiveAccount.profile.name, school: effectiveAccount.profile.school, avatar: effectiveAccount.profile.avatar, title: momentsTitle.trim(), content: momentsInput.trim(), media, createdAt: Date.now(), dateLabel: currentDateLabel(), likes: [], comments: [] };
         setMomentsFeed((prev) => [post, ...prev]);
@@ -3120,7 +3190,7 @@
           const previewUrl = URL.createObjectURL(file);
           momentCommentImageDraftUrlsRef.current[momentId].push(previewUrl);
           const persisted = await persistFile(file, 'image');
-          return { kind: 'image', mediaId: persisted.id, name: persisted.name, type: persisted.type, size: persisted.size, localPreviewSrc: previewUrl, src: previewUrl };
+          return { kind: 'image', mediaId: persisted.mediaId || persisted.id, storagePath: persisted.storagePath || '', cloud: !!persisted.cloud, name: persisted.name, type: persisted.type, size: persisted.size, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl };
         }));
         setMomentCommentImageDrafts((prev) => ({ ...prev, [momentId]: items }));
         setMomentCommentNotice((prev) => ({ ...prev, [momentId]: `评论图片已保存到本地，可发送 ${items.length} 张。` }));
@@ -3137,7 +3207,7 @@
         const value = (momentComments[momentId] || '').trim();
         const images = momentCommentImageDrafts[momentId] || [];
         if (!value && images.length === 0) return;
-        updateMomentInStores(momentId, (item) => ({ ...item, comments: [{ id: `c-${Date.now()}`, username: currentUsername, author: currentAccount.profile.name, avatar: currentAccount.profile.avatar, text: value, images: images.map((img) => ({ kind: 'image', mediaId: img.mediaId, name: img.name, type: img.type, size: img.size })), dateLabel: currentDateLabel(), createdAt: Date.now() }, ...(item.comments || [])] }));
+        updateMomentInStores(momentId, (item) => ({ ...item, comments: [{ id: `c-${Date.now()}`, username: currentUsername, author: currentAccount.profile.name, avatar: currentAccount.profile.avatar, text: value, images: images.map((img) => ({ kind: 'image', mediaId: img.mediaId, storagePath: img.storagePath || '', cloud: !!img.cloud, name: img.name, type: img.type, size: img.size, localPreviewSrc: img.localPreviewSrc || img.src || '', src: img.src || img.localPreviewSrc || '' })), dateLabel: currentDateLabel(), createdAt: Date.now() }, ...(item.comments || [])] }));
         setMomentComments((prev) => ({ ...prev, [momentId]: '' }));
         clearMomentCommentImages(momentId, true);
         setMomentCommentNotice((prev) => ({ ...prev, [momentId]: '评论已发送。' }));
@@ -3218,7 +3288,7 @@
               username: currentUsername,
               author: currentAccount.profile.name,
               avatar: currentAccount.profile.avatar,
-              audio: { mediaId: persisted.id, name: persisted.name, type: persisted.type, size: persisted.size, localPreviewSrc: previewUrl },
+              audio: { mediaId: persisted.mediaId || persisted.id, storagePath: persisted.storagePath || '', cloud: !!persisted.cloud, name: persisted.name, type: persisted.type, size: persisted.size, localPreviewSrc: persisted.localPreviewSrc || previewUrl, src: persisted.src || persisted.localPreviewSrc || previewUrl },
               dateLabel: currentDateLabel(),
               createdAt: Date.now(),
             }, ...(item.comments || [])]
