@@ -1,0 +1,13 @@
+# 先安装 Firebase CLI
+npm install -g firebase-tools
+
+# 登录
+firebase login
+
+# 在当前目录初始化（如果你要把 rules 也一起管）
+firebase init firestore
+firebase init storage
+
+# 部署规则
+firebase deploy --only firestore:rules
+firebase deploy --only storage
